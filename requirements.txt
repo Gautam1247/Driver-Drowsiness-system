@@ -7,3 +7,6 @@ pandas
 tqdm
 PyYAML
 ultralytics
+mediapipe
+flask 
+flask-cors
