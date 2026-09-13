@@ -29,7 +29,7 @@ class DriverTemporalEngine:
         perclos_minimum_observation=10.0,
         perclos_warning_threshold=0.20,
         perclos_drowsy_threshold=0.30,
-        eye_confidence_threshold=0.65,
+        eye_confidence_threshold=0.50,
         mouth_confidence_threshold=0.65,
         max_eye_observation_gap=0.80,
         yawning_missing_grace_period=0.80,
@@ -39,7 +39,7 @@ class DriverTemporalEngine:
         self.eye_closure_threshold = float(eye_closure_threshold)
         self.warning_closure_threshold = float(warning_closure_threshold)
         self.blink_max_duration = float(blink_max_duration)
-        self.yawning_threshold = float(yawning_threshold)
+        self.yawning_threshold = max(1.2, float(yawning_threshold))
         self.phone_threshold = float(phone_threshold)
         self.seatbelt_threshold = float(seatbelt_threshold)
 
@@ -70,6 +70,7 @@ class DriverTemporalEngine:
         self.yawning_since = None
         self.last_yawning_timestamp = None
         self.last_yawning_confidence = 0.0
+        self.last_mouth_observation_id = None
 
         # Phone
         self.phone_detected_since = None
@@ -89,41 +90,68 @@ class DriverTemporalEngine:
     # Eye helpers
     # ------------------------------------------------------------------
     def _get_valid_eyes(self, eyes):
+        """Return usable eye predictions without discarding moderate CNN confidence."""
         valid = []
         for eye in eyes or []:
             state = eye.get("state")
             confidence = float(eye.get("confidence", 0.0))
-            if state in {"OPEN", "CLOSED"} and confidence >= self.eye_confidence_threshold:
-                valid.append({
-                    "state": state,
-                    "confidence": confidence,
-                    "box": eye.get("box"),
-                })
+            if state not in {"OPEN", "CLOSED"}:
+                continue
+            if confidence < self.eye_confidence_threshold:
+                continue
+            valid.append({
+                "state": state,
+                "confidence": confidence,
+                "closed_probability": float(eye.get("closed_probability", 1.0 if state == "CLOSED" else 0.0)),
+                "open_probability": float(eye.get("open_probability", 1.0 if state == "OPEN" else 0.0)),
+                "yolo_class": eye.get("yolo_class"),
+                "box": eye.get("box"),
+            })
         return valid
 
-    def _get_eye_state(self, eyes):
-        """Return bilateral OPEN/CLOSED or None when evidence conflicts."""
+    def _get_eye_probabilities(self, eyes):
         valid = self._get_valid_eyes(eyes)
         if len(valid) < 2:
+            return None, None
+
+        closed_probs = []
+        open_probs = []
+        for item in valid:
+            c = item["closed_probability"]
+            o = item["open_probability"]
+            # If the CNN is only moderately confident, retain the YOLO
+            # class as a weak localization/classification prior. YOLO was
+            # trained with explicit open_eye/closed_eye classes.
+            if item["confidence"] < 0.65 and item.get("yolo_class") in {0, 1}:
+                yolo_closed = 1.0 if int(item["yolo_class"]) == 1 else 0.0
+                yolo_open = 1.0 - yolo_closed
+                c = 0.70 * c + 0.30 * yolo_closed
+                o = 0.70 * o + 0.30 * yolo_open
+            closed_probs.append(c)
+            open_probs.append(o)
+        return sum(closed_probs) / len(closed_probs), sum(open_probs) / len(open_probs)
+
+    def _get_eye_state(self, eyes):
+        closed_probability, open_probability = self._get_eye_probabilities(eyes)
+        if closed_probability is None:
             return None
-        states = [item["state"] for item in valid]
-        if all(state == "CLOSED" for state in states):
+        if closed_probability >= 0.60 and closed_probability > open_probability:
             return "CLOSED"
-        if all(state == "OPEN" for state in states):
+        if open_probability >= 0.60 and open_probability > closed_probability:
             return "OPEN"
         return None
 
     def _get_display_eye_state(self, eyes):
         valid = self._get_valid_eyes(eyes)
-        if not valid:
-            return "OPEN"
-        if len(valid) >= 2:
-            states = [item["state"] for item in valid]
-            if all(state == "CLOSED" for state in states):
+        closed_probability, open_probability = self._get_eye_probabilities(eyes)
+        if closed_probability is not None:
+            if closed_probability >= 0.60 and closed_probability > open_probability:
                 return "CLOSED"
-            if all(state == "OPEN" for state in states):
+            if open_probability >= 0.60 and open_probability > closed_probability:
                 return "OPEN"
-        return max(valid, key=lambda item: item["confidence"])["state"]
+        if valid:
+            return max(valid, key=lambda item: item["confidence"])["state"]
+        return "OPEN"
 
     # ------------------------------------------------------------------
     # PERCLOS
@@ -272,35 +300,47 @@ class DriverTemporalEngine:
         # YAWNING
         # ==============================================================
         mouth = inference_result.get("mouth", {}) or {}
-        mouth_state = mouth.get("state", "UNKNOWN")
+        mouth_state = mouth.get("state", "NON_YAWNING")
         mouth_conf = float(mouth.get("confidence", 0.0))
+        yawn_probability = float(mouth.get("yawning_probability", 1.0 if mouth_state == "YAWNING" else 0.0))
+        observation_id = mouth.get("observation_id")
+        fresh_mouth = bool(mouth.get("fresh_observation", True))
 
-        valid_yawn = mouth_state == "YAWNING" and mouth_conf >= self.mouth_confidence_threshold
-        if valid_yawn:
-            if self.yawning_since is None:
-                self.yawning_since = timestamp
-            self.last_yawning_timestamp = timestamp
-            self.last_yawning_confidence = mouth_conf
-            duration = max(0.0, timestamp - self.yawning_since)
-            result["yawning"]["duration"] = duration
-            result["yawning"]["confidence"] = mouth_conf
-            if duration >= self.yawning_threshold:
-                result["yawning"]["state"] = "YAWNING"
-                result["yawning"]["alert"] = True
-            else:
-                result["yawning"]["state"] = "YAWNING" if duration >= self.yawning_threshold else "NON_YAWNING"
-        elif mouth_state == "NON_YAWNING":
-            self.yawning_since = None
-            self.last_yawning_timestamp = None
-            result["yawning"]["state"] = "NOT_YAWNING"
-            result["yawning"]["confidence"] = mouth_conf
-        else:
-            gap = (
-                timestamp - self.last_yawning_timestamp
-                if self.last_yawning_timestamp is not None
-                else float("inf")
+        # A cached mouth classification is NOT a new observation. This is
+        # critical: otherwise one false YAWNING prediction gets replayed
+        # every other frame and the temporal timer incorrectly turns it into
+        # a sustained yawn.
+        new_mouth_observation = (
+            fresh_mouth
+            and observation_id is not None
+            and observation_id != self.last_mouth_observation_id
+        )
+
+        if new_mouth_observation:
+            self.last_mouth_observation_id = observation_id
+
+            valid_yawn = (
+                mouth_state == "YAWNING"
+                and mouth_conf >= self.mouth_confidence_threshold
+                and yawn_probability >= 0.70
             )
-            if self.yawning_since is not None and gap <= self.yawning_missing_grace_period:
+
+            if valid_yawn:
+                if self.yawning_since is None:
+                    self.yawning_since = timestamp
+                self.last_yawning_timestamp = timestamp
+                self.last_yawning_confidence = mouth_conf
+            else:
+                # A fresh NON_YAWNING observation is authoritative and
+                # immediately cancels a pending/active yawn.
+                self.yawning_since = None
+                self.last_yawning_timestamp = None
+                self.last_yawning_confidence = 0.0
+
+        # Report the temporal state from the current confirmed run.
+        if self.yawning_since is not None and self.last_yawning_timestamp is not None:
+            gap = max(0.0, timestamp - self.last_yawning_timestamp)
+            if gap <= self.yawning_missing_grace_period:
                 duration = max(0.0, timestamp - self.yawning_since)
                 result["yawning"]["duration"] = duration
                 result["yawning"]["confidence"] = self.last_yawning_confidence
@@ -308,11 +348,15 @@ class DriverTemporalEngine:
                     result["yawning"]["state"] = "YAWNING"
                     result["yawning"]["alert"] = True
                 else:
-                    result["yawning"]["state"] = "YAWNING" if duration >= self.yawning_threshold else "NON_YAWNING"
+                    result["yawning"]["state"] = "NON_YAWNING"
             else:
                 self.yawning_since = None
                 self.last_yawning_timestamp = None
-                result["yawning"]["state"] = "NON_YAWNING"
+                self.last_yawning_confidence = 0.0
+
+        if self.yawning_since is None:
+            result["yawning"]["state"] = "NON_YAWNING"
+            result["yawning"]["confidence"] = yawn_probability if mouth_state == "YAWNING" else mouth_conf
 
         # ==============================================================
         # PHONE
@@ -420,6 +464,7 @@ class DriverTemporalEngine:
         self.yawning_since = None
         self.last_yawning_timestamp = None
         self.last_yawning_confidence = 0.0
+        self.last_mouth_observation_id = None
 
         self.phone_detected_since = None
         self.last_phone_timestamp = None

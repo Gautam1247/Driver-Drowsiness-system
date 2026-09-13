@@ -124,6 +124,7 @@ class DriverInferenceEngine:
         self.mouth_inference_interval = 2
         self._frame_counter = 0
         self._last_mouth_result = None
+        self._mouth_observation_id = 0
 
         self.x_padding = 0.30
         self.y_padding = 0.45
@@ -812,6 +813,8 @@ class DriverInferenceEngine:
                 "box": None,
                 "yawning_probability": 0.0,
                 "non_yawning_probability": 0.0,
+                "observation_id": 0,
+                "fresh_observation": False,
             },
         }
 
@@ -1044,6 +1047,7 @@ class DriverInferenceEngine:
             cached = self._last_mouth_result
             result["face"]["detected"] = bool(cached.get("face_detected", False))
             result["mouth"] = dict(cached.get("mouth", result["mouth"]))
+            result["mouth"]["fresh_observation"] = False
         else:
             image_rgb = cv2.cvtColor(
                 frame,
@@ -1071,13 +1075,21 @@ class DriverInferenceEngine:
 
                 if mouth_roi is not None:
                     mouth_result = self._predict_mouth(mouth_roi["crop"])
+                    self._mouth_observation_id += 1
                     result["mouth"] = {
                         "state": mouth_result["state"],
                         "confidence": mouth_result["confidence"],
                         "box": mouth_roi["box"],
                         "yawning_probability": mouth_result["yawning_probability"],
                         "non_yawning_probability": mouth_result["non_yawning_probability"],
+                        "observation_id": self._mouth_observation_id,
+                        "fresh_observation": True,
                     }
+                else:
+                    self._mouth_observation_id += 1
+                    result["mouth"]["state"] = "NON_YAWNING"
+                    result["mouth"]["observation_id"] = self._mouth_observation_id
+                    result["mouth"]["fresh_observation"] = True
 
                 self._last_mouth_result = {
                     "face_detected": result["face"]["detected"],
@@ -1086,6 +1098,10 @@ class DriverInferenceEngine:
             else:
                 # Do not retain a stale mouth result indefinitely. The
                 # temporal engine has its own short grace period.
+                self._mouth_observation_id += 1
+                result["mouth"]["observation_id"] = self._mouth_observation_id
+                result["mouth"]["fresh_observation"] = True
+                result["mouth"]["state"] = "NON_YAWNING"
                 self._last_mouth_result = {
                     "face_detected": False,
                     "mouth": dict(result["mouth"]),
