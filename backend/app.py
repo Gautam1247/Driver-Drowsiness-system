@@ -90,13 +90,18 @@ class DriverSession:
         self.started_at = time.time()
         self.last_result: dict[str, Any] | None = None
 
-    def process(self, frame: np.ndarray) -> dict[str, Any]:
+    def process(self, frame: np.ndarray, capture_timestamp: float | None = None) -> dict[str, Any]:
         with self.lock:
             self.frame_count += 1
 
-            # Wall-clock monotonic time is used because the temporal engine
-            # reasons about real elapsed time.
-            timestamp = time.monotonic()
+            # Prefer the timestamp captured when the browser frame entered
+            # the frontend. This keeps temporal analysis tied to real camera
+            # time even when CPU inference takes longer than one frame period.
+            timestamp = (
+                float(capture_timestamp)
+                if capture_timestamp is not None
+                else time.monotonic()
+            )
 
             inference_start = time.perf_counter()
 
@@ -268,7 +273,19 @@ def process_frame():
     try:
         frame = decode_uploaded_frame()
         session = get_or_create_session(session_id)
-        result = session.process(frame)
+
+        capture_timestamp_raw = request.form.get("capture_timestamp")
+        capture_timestamp = None
+        if capture_timestamp_raw:
+            try:
+                capture_timestamp = float(capture_timestamp_raw)
+            except ValueError:
+                capture_timestamp = None
+
+        result = session.process(
+            frame,
+            capture_timestamp=capture_timestamp,
+        )
         return jsonify(result)
 
     except Exception as exc:

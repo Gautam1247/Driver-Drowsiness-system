@@ -41,7 +41,7 @@ class DriverInferenceEngine:
         self,
         project_root=None,
         device="cpu",
-        yolo_confidence=0.05,
+        yolo_confidence=0.25,
         face_detection_confidence=0.30,
         face_presence_confidence=0.30,
     ):
@@ -105,20 +105,6 @@ class DriverInferenceEngine:
             yolo_confidence
         )
 
-        # ----------------------------------------------------
-        # Phone diagnostic configuration
-        # ----------------------------------------------------
-        # Observe weak phone candidates without changing the
-        # acceptance threshold used for confirmed phone usage.
-        self.yolo_candidate_confidence = min(
-            0.01,
-            self.yolo_confidence
-        )
-        self.phone_acceptance_confidence = max(
-            0.05,
-            self.yolo_confidence
-        )
-
         self.face_detection_confidence = (
             face_detection_confidence
         )
@@ -127,10 +113,17 @@ class DriverInferenceEngine:
             face_presence_confidence
         )
 
-        # Diagnostic frame counter.
-        self._diagnostic_frame_count = 0
-
         self.image_size = 224
+
+        # CPU live-inference tuning. These do not change model weights.
+        # A smaller YOLO inference size and capped detections reduce CPU
+        # latency; mouth inference is refreshed every second frame because
+        # yawning is a temporal event rather than a per-pixel frame task.
+        self.yolo_image_size = 448
+        self.yolo_max_detections = 20
+        self.mouth_inference_interval = 2
+        self._frame_counter = 0
+        self._last_mouth_result = None
 
         self.x_padding = 0.30
         self.y_padding = 0.45
@@ -499,7 +492,7 @@ class DriverInferenceEngine:
             .to(self.device)
         )
 
-        with torch.no_grad():
+        with torch.inference_mode():
 
             output = (
                 self.eye_model(
@@ -573,7 +566,7 @@ class DriverInferenceEngine:
             .to(self.device)
         )
 
-        with torch.no_grad():
+        with torch.inference_mode():
 
             output = (
                 self.mouth_model(
@@ -771,13 +764,14 @@ class DriverInferenceEngine:
                 "Input frame is None."
             )
 
+        self._frame_counter += 1
+
         if len(frame.shape) != 3:
 
             raise ValueError(
                 "Expected BGR color image."
             )
 
-        self._diagnostic_frame_count += 1
 
         height, width = (
             frame.shape[:2]
@@ -800,9 +794,6 @@ class DriverInferenceEngine:
                 "detected": False,
                 "confidence": 0.0,
                 "box": None,
-                "candidate": False,
-                "candidate_confidence": 0.0,
-                "candidate_box": None,
             },
 
             "seatbelt": {
@@ -832,7 +823,9 @@ class DriverInferenceEngine:
         yolo_results = (
             self.yolo_model.predict(
                 source=frame,
-                conf=self.yolo_candidate_confidence,
+                conf=self.yolo_confidence,
+                imgsz=self.yolo_image_size,
+                max_det=self.yolo_max_detections,
                 device="cpu",
                 verbose=False
             )
@@ -871,57 +864,6 @@ class DriverInferenceEngine:
                     .cpu()
                     .numpy()
                 )
-
-                # --------------------------------------------
-                # Phone diagnostic candidate
-                # --------------------------------------------
-                phone_candidates = []
-
-                for cls_id, confidence, box in zip(
-                    classes, confidences, xyxy
-                ):
-                    if int(cls_id) != self.PHONE_CLASS:
-                        continue
-
-                    phone_candidates.append({
-                        "confidence": float(confidence),
-                        "box": tuple(map(int, box)),
-                    })
-
-                phone_candidates.sort(
-                    key=lambda item: item["confidence"],
-                    reverse=True
-                )
-
-                if phone_candidates:
-                    result["phone"]["candidate"] = True
-                    result["phone"]["candidate_confidence"] = (
-                        phone_candidates[0]["confidence"]
-                    )
-                    result["phone"]["candidate_box"] = (
-                        phone_candidates[0]["box"]
-                    )
-
-                # Print the strongest phone candidate every 30 frames.
-                # This is diagnostic output only and does not affect
-                # the detection/temporal logic.
-                if self._diagnostic_frame_count % 30 == 0:
-                    if phone_candidates:
-                        print(
-                            f"[PHONE YOLO DEBUG] Frame "
-                            f"{self._diagnostic_frame_count}: "
-                            f"candidate_conf="
-                            f"{phone_candidates[0]['confidence']:.4f} "
-                            f"accepted="
-                            f"{phone_candidates[0]['confidence'] >= self.phone_acceptance_confidence}"
-                        )
-                    else:
-                        print(
-                            f"[PHONE YOLO DEBUG] Frame "
-                            f"{self._diagnostic_frame_count}: "
-                            f"NO PHONE CANDIDATE >= "
-                            f"{self.yolo_candidate_confidence:.2f}"
-                        )
 
 
                 # --------------------------------------------
@@ -1028,12 +970,6 @@ class DriverInferenceEngine:
                         self.PHONE_CLASS
                     ):
 
-                        # Weak phone candidates are logged above, but
-                        # only candidates meeting this threshold are
-                        # accepted as actual phone detections.
-                        if confidence < self.phone_acceptance_confidence:
-                            continue
-
                         if (
                             not result[
                                 "phone"
@@ -1091,95 +1027,68 @@ class DriverInferenceEngine:
 
 
         # ====================================================
-        # MEDIAPIPE
+        # MEDIAPIPE / MOUTH
         # ====================================================
 
-        image_rgb = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
+        # MediaPipe + mouth CNN are the most useful part of the pipeline
+        # to decimate slightly for CPU live use. Every second frame is
+        # refreshed; temporal_engine supplies the persistence between
+        # refreshed observations. This keeps the camera responsive without
+        # changing the trained mouth model.
+        use_cached_mouth = (
+            self._last_mouth_result is not None
+            and self._frame_counter % self.mouth_inference_interval != 0
         )
 
-        mp_image = mp.Image(
-            image_format=(
-                mp.ImageFormat.SRGB
-            ),
-            data=image_rgb
-        )
-
-        try:
-
-            detection_result = (
-                self.face_landmarker.detect(
-                    mp_image
-                )
+        if use_cached_mouth:
+            cached = self._last_mouth_result
+            result["face"]["detected"] = bool(cached.get("face_detected", False))
+            result["mouth"] = dict(cached.get("mouth", result["mouth"]))
+        else:
+            image_rgb = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
             )
 
-        except Exception:
-
-            detection_result = None
-
-
-        # ====================================================
-        # FACE / MOUTH
-        # ====================================================
-
-        if (
-            detection_result is not None
-            and detection_result.face_landmarks
-        ):
-
-            result[
-                "face"
-            ]["detected"] = True
-
-            landmarks = (
-                detection_result
-                .face_landmarks[0]
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=image_rgb
             )
 
-            mouth_roi = (
-                self._get_mouth_roi(
-                    frame,
-                    landmarks
-                )
-            )
+            try:
+                detection_result = self.face_landmarker.detect(mp_image)
+            except Exception:
+                detection_result = None
 
-            if mouth_roi is not None:
+            if (
+                detection_result is not None
+                and detection_result.face_landmarks
+            ):
+                result["face"]["detected"] = True
 
-                mouth_result = (
-                    self._predict_mouth(
-                        mouth_roi[
-                            "crop"
-                        ]
-                    )
-                )
+                landmarks = detection_result.face_landmarks[0]
+                mouth_roi = self._get_mouth_roi(frame, landmarks)
 
-                result[
-                    "mouth"
-                ] = {
-                    "state": mouth_result[
-                        "state"
-                    ],
+                if mouth_roi is not None:
+                    mouth_result = self._predict_mouth(mouth_roi["crop"])
+                    result["mouth"] = {
+                        "state": mouth_result["state"],
+                        "confidence": mouth_result["confidence"],
+                        "box": mouth_roi["box"],
+                        "yawning_probability": mouth_result["yawning_probability"],
+                        "non_yawning_probability": mouth_result["non_yawning_probability"],
+                    }
 
-                    "confidence": mouth_result[
-                        "confidence"
-                    ],
-
-                    "box": mouth_roi[
-                        "box"
-                    ],
-
-                    "yawning_probability": (
-                        mouth_result[
-                            "yawning_probability"
-                        ]
-                    ),
-
-                    "non_yawning_probability": (
-                        mouth_result[
-                            "non_yawning_probability"
-                        ]
-                    ),
+                self._last_mouth_result = {
+                    "face_detected": result["face"]["detected"],
+                    "mouth": dict(result["mouth"]),
+                }
+            else:
+                # Do not retain a stale mouth result indefinitely. The
+                # temporal engine has its own short grace period.
+                self._last_mouth_result = {
+                    "face_detected": False,
+                    "mouth": dict(result["mouth"]),
                 }
 
 

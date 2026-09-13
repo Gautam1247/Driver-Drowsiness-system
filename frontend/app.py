@@ -27,6 +27,8 @@ from streamlit_webrtc import (
 )
 
 BACKEND_URL = "http://127.0.0.1:5000"
+AI_FRAME_WIDTH = 640
+AI_FRAME_HEIGHT = 360
 
 
 # =====================================================================
@@ -57,11 +59,13 @@ class LatestResultStore:
 
 class DriverVideoProcessor(VideoProcessorBase):
     """
-    Receives webcam frames from WebRTC and sends them to Flask.
+    WebRTC video processor with a latest-frame inference worker.
 
-    IMPORTANT:
-    No Streamlit UI calls are made inside recv(). Streamlit UI is updated
-    by the fragment below using the thread-safe result store.
+    The camera callback NEVER waits for Flask/AI inference. That is the
+    critical real-time fix: the browser can continue rendering camera frames
+    at its native rate while a background worker continuously processes only
+    the newest available frame. Older frames are deliberately dropped rather
+    than allowed to form a queue and create seconds of latency.
     """
 
     def __init__(self, backend_url: str, session_id: str, store: LatestResultStore):
@@ -71,70 +75,149 @@ class DriverVideoProcessor(VideoProcessorBase):
 
         self.http = requests.Session()
         self.frame_count = 0
-        self.last_request_time = 0.0
+
+        self._frame_lock = threading.Lock()
+        self._pending_frame: np.ndarray | None = None
+        self._pending_timestamp: float | None = None
+        self._wake_event = threading.Event()
+        self._stop_event = threading.Event()
+
+        self._latest_result: dict[str, Any] | None = None
+        self._latest_result_lock = threading.Lock()
+
+        self._worker = threading.Thread(
+            target=self._inference_worker,
+            name=f"DMS-Inference-{session_id[:8]}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _set_latest_result(self, result: dict[str, Any]) -> None:
+        with self._latest_result_lock:
+            self._latest_result = result
+
+    def _get_latest_result(self) -> dict[str, Any] | None:
+        with self._latest_result_lock:
+            return self._latest_result
+
+    def _inference_worker(self) -> None:
+        """Process the newest pending frame without blocking WebRTC recv()."""
+        while not self._stop_event.is_set():
+            self._wake_event.wait(timeout=0.25)
+            self._wake_event.clear()
+
+            if self._stop_event.is_set():
+                break
+
+            while not self._stop_event.is_set():
+                with self._frame_lock:
+                    image = self._pending_frame
+                    capture_timestamp = self._pending_timestamp
+                    self._pending_frame = None
+                    self._pending_timestamp = None
+
+                if image is None:
+                    break
+
+                # Send a smaller AI frame to CPU inference. The displayed
+                # camera remains full resolution; detection boxes are scaled
+                # back to display coordinates by draw_box().
+                ai_frame = cv2.resize(
+                    image,
+                    (AI_FRAME_WIDTH, AI_FRAME_HEIGHT),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+                ok, encoded = cv2.imencode(
+                    ".jpg",
+                    ai_frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 55],
+                )
+                if not ok:
+                    continue
+
+                try:
+                    response = self.http.post(
+                        f"{self.backend_url}/api/frame",
+                        files={
+                            "frame": (
+                                "frame.jpg",
+                                encoded.tobytes(),
+                                "image/jpeg",
+                            )
+                        },
+                        data={
+                            "session_id": self.session_id,
+                            "capture_timestamp": str(capture_timestamp),
+                        },
+                        timeout=5.0,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+
+                    if result.get("ok"):
+                        self.store.set_result(result)
+                        self._set_latest_result(result)
+                    else:
+                        self.store.set_error(
+                            result.get("error", "Backend returned an unknown error.")
+                        )
+                except Exception as exc:
+                    self.store.set_error(str(exc))
 
     def recv(self, frame: VideoFrame) -> VideoFrame:
+        """
+        Accept a camera frame immediately.
+
+        This method intentionally does NOT make an HTTP request. Blocking
+        here was the reason the visible camera was effectively running at
+        the AI inference rate (~4-5 FPS).
+        """
         image = frame.to_ndarray(format="bgr24")
         self.frame_count += 1
+        capture_timestamp = time.monotonic()
 
-        # JPEG keeps network payloads manageable.
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            image,
-            [cv2.IMWRITE_JPEG_QUALITY, 80],
+        # Latest-frame queue: replace anything waiting to be processed.
+        with self._frame_lock:
+            self._pending_frame = image.copy()
+            self._pending_timestamp = capture_timestamp
+
+        self._wake_event.set()
+
+        # Return the camera frame immediately. Overlay the newest completed
+        # AI result if one exists; the camera itself is never held hostage by
+        # inference latency.
+        annotated = image.copy()
+        latest = self._get_latest_result()
+        if latest is not None:
+            annotated = draw_overlay(annotated, latest)
+
+        cv2.putText(
+            annotated,
+            "LIVE CAMERA",
+            (15, annotated.shape[0] - 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
         )
 
-        if not ok:
-            return VideoFrame.from_ndarray(image, format="bgr24")
-
-        try:
-            response = self.http.post(
-                f"{self.backend_url}/api/frame",
-                files={
-                    "frame": (
-                        "frame.jpg",
-                        encoded.tobytes(),
-                        "image/jpeg",
-                    )
-                },
-                data={"session_id": self.session_id},
-                timeout=3.0,
-            )
-
-            response.raise_for_status()
-            result = response.json()
-
-            if result.get("ok"):
-                self.store.set_result(result)
-                annotated = draw_overlay(image.copy(), result)
-            else:
-                self.store.set_error(
-                    result.get("error", "Backend returned an unknown error.")
-                )
-                annotated = image
-
-        except Exception as exc:
-            self.store.set_error(str(exc))
-            annotated = image
-
-        # Show a small frontend-side FPS indicator.
-        now = time.perf_counter()
-        if self.last_request_time:
-            dt = now - self.last_request_time
-            if dt > 0:
-                cv2.putText(
-                    annotated,
-                    f"Frontend FPS: {1.0 / dt:.1f}",
-                    (15, annotated.shape[0] - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-        self.last_request_time = now
-
         return VideoFrame.from_ndarray(annotated, format="bgr24")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        try:
+            self.http.close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
 
 
 # =====================================================================
@@ -163,8 +246,23 @@ def draw_box(
     box,
     label: str,
     thickness: int = 2,
+    source_width: int | None = None,
+    source_height: int | None = None,
 ):
     h, w = frame.shape[:2]
+
+    # Model detections are produced on the smaller AI frame. Scale them to
+    # the full-resolution WebRTC frame before drawing.
+    if source_width and source_height and source_width > 0 and source_height > 0:
+        sx = w / float(source_width)
+        sy = h / float(source_height)
+        box = [
+            float(box[0]) * sx,
+            float(box[1]) * sy,
+            float(box[2]) * sx,
+            float(box[3]) * sy,
+        ] if box and len(box) == 4 else box
+
     coords = clamp_box(box, w, h)
 
     if coords is None:
@@ -198,6 +296,8 @@ def draw_overlay(frame: np.ndarray, result: dict[str, Any]) -> np.ndarray:
     temporal = result.get("temporal", {})
     safety = result.get("safety", {})
     alerts = result.get("alerts", {})
+    source_width = int(inference.get("frame_width", 0) or 0)
+    source_height = int(inference.get("frame_height", 0) or 0)
 
     # --------------------------------------------------------------
     # Eye detections
@@ -206,7 +306,7 @@ def draw_overlay(frame: np.ndarray, result: dict[str, Any]) -> np.ndarray:
         state = eye.get("state", "UNKNOWN")
         confidence = float(eye.get("confidence", 0.0))
         label = f"EYE {state} {confidence:.2f}"
-        draw_box(frame, eye.get("box"), label)
+        draw_box(frame, eye.get("box"), label, source_width=source_width, source_height=source_height)
 
     # --------------------------------------------------------------
     # Phone
@@ -219,6 +319,8 @@ def draw_overlay(frame: np.ndarray, result: dict[str, Any]) -> np.ndarray:
             phone.get("box"),
             f"PHONE {conf:.2f}",
             thickness=3,
+            source_width=source_width,
+            source_height=source_height,
         )
 
     # --------------------------------------------------------------
@@ -232,29 +334,36 @@ def draw_overlay(frame: np.ndarray, result: dict[str, Any]) -> np.ndarray:
             seatbelt.get("box"),
             f"SEATBELT {conf:.2f}",
             thickness=3,
+            source_width=source_width,
+            source_height=source_height,
         )
 
     # --------------------------------------------------------------
     # Mouth
     # --------------------------------------------------------------
     mouth = inference.get("mouth", {})
-    mouth_state = mouth.get("state", "UNKNOWN")
+    mouth_state = mouth.get("state", "NON_YAWNING")
 
-    if mouth_state != "UNKNOWN":
+    if mouth_state == "UNKNOWN":
+        mouth_state = "NON_YAWNING"
+
+    if mouth.get("box") is not None:
         conf = float(mouth.get("confidence", 0.0))
         draw_box(
             frame,
             mouth.get("box"),
             f"MOUTH {mouth_state} {conf:.2f}",
+            source_width=source_width,
+            source_height=source_height,
         )
 
     # --------------------------------------------------------------
     # Main safety information
     # --------------------------------------------------------------
-    driver_status = safety.get("driver_status", "UNKNOWN")
+    driver_status = safety.get("driver_status", "NORMAL")
 
     risk = safety.get("risk", {})
-    risk_level = risk.get("level", "UNKNOWN")
+    risk_level = risk.get("level", "NORMAL")
 
     drowsiness = temporal.get("drowsiness", {})
     yawning = temporal.get("yawning", {})
@@ -264,13 +373,13 @@ def draw_overlay(frame: np.ndarray, result: dict[str, Any]) -> np.ndarray:
     lines = [
         f"DRIVER: {driver_status}",
         f"RISK: {risk_level}",
-        f"DROWSINESS: {drowsiness.get('state', 'UNKNOWN')}",
+        f"DROWSINESS: {drowsiness.get('state', 'NORMAL')}",
         f"EYE CLOSURE: {float(drowsiness.get('eye_closed_duration', 0.0)):.1f}s",
         f"PERCLOS: {float(drowsiness.get('perclos', 0.0)):.2f}",
         f"BLINKS: {drowsiness.get('blink_count', 0)}",
-        f"YAWNING: {yawning.get('state', 'UNKNOWN')}",
-        f"PHONE: {phone_temporal.get('state', 'UNKNOWN')}",
-        f"SEATBELT: {seatbelt_temporal.get('state', 'UNKNOWN')}",
+        f"YAWNING: {yawning.get('state', 'NON_YAWNING')}",
+        f"PHONE: {phone_temporal.get('state', 'NOT_DETECTED')}",
+        f"SEATBELT: {seatbelt_temporal.get('state', 'DETECTED')}",
     ]
 
     x = 15
@@ -930,7 +1039,7 @@ with dashboard_col:
     dashboard_placeholder = st.empty()
 
 
-@st.fragment(run_every="500ms")
+@st.fragment(run_every="200ms")
 def live_dashboard():
     result, error, last_update = st.session_state.store.get()
 
@@ -959,8 +1068,8 @@ def live_dashboard():
     alerts = result.get("alerts", {})
     risk = safety.get("risk", {})
 
-    driver_status = str(safety.get("driver_status", "UNKNOWN"))
-    risk_level = str(risk.get("level", "UNKNOWN"))
+    driver_status = str(safety.get("driver_status", "NORMAL"))
+    risk_level = str(risk.get("level", "NORMAL"))
     risk_score = risk.get("score", 0)
 
     drowsiness = temporal.get("drowsiness", {})
@@ -968,10 +1077,16 @@ def live_dashboard():
     phone = temporal.get("phone", {})
     seatbelt = temporal.get("seatbelt", {})
 
-    drowsy_state = str(drowsiness.get("state", "UNKNOWN"))
-    yawning_state = str(yawning.get("state", "UNKNOWN"))
-    phone_state = str(phone.get("state", "UNKNOWN"))
-    seatbelt_state = str(seatbelt.get("state", "UNKNOWN"))
+    drowsy_state = str(drowsiness.get("state", "NORMAL"))
+    yawning_state = str(yawning.get("state", "NON_YAWNING"))
+    phone_state = str(phone.get("state", "NOT_DETECTED"))
+    seatbelt_state = str(seatbelt.get("state", "DETECTED"))
+
+    # The dashboard intentionally exposes deterministic user-facing states.
+    if drowsy_state not in {"NORMAL", "DROWSY"}:
+        drowsy_state = "DROWSY" if drowsy_state == "DROWSY" else "NORMAL"
+    if yawning_state not in {"NON_YAWNING", "YAWNING"}:
+        yawning_state = "YAWNING" if yawning_state == "YAWNING" else "NON_YAWNING"
 
     active_violations = safety.get("active_violations", []) or []
     display_alerts = alerts.get("display_alerts", []) or []
