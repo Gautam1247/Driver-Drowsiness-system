@@ -16,6 +16,8 @@ datasets/
 *.zip
 *.rar
 *.7z
+evaluation/
+videos/
 
 # Trained models
 models/*.pt
